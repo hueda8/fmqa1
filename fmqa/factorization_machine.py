@@ -1,5 +1,5 @@
 """
-Factorization Machine implemented with MXNet Gluon
+Factorization Machine implemented with PyTorch
 """
 
 __all__ = [
@@ -7,59 +7,76 @@ __all__ = [
 ]
 
 import numpy as np
-import mxnet as mx
-from   mxnet import nd
-from   mxnet import gluon
+import torch
+import torch.nn as nn
 
-def triu_mask(input_size, F=nd):
-    """Generate a square matrix with its upper trianguler elements being 1 and others 0.
-    """
-    mask = F.expand_dims(F.arange(input_size), axis=0)
-    return (F.transpose(mask) < mask) * 1.0
 
-def VtoQ(V, F=nd):
+def triu_mask(input_size: int, device=None, dtype=None):
+    """Generate a square matrix with its upper triangular elements (i<j) being 1 and others 0."""
+    idx = torch.arange(input_size, device=device)
+    # mask[i, j] = 1 if i < j else 0
+    mask = (idx.view(-1, 1) < idx.view(1, -1)).to(dtype=dtype if dtype is not None else torch.float32)
+    return mask
+
+
+def VtoQ(V: torch.Tensor) -> torch.Tensor:
     """Calculate interaction strength by inner product of feature vectors.
-    """
-    input_size = V.shape[1]
-    Q = F.dot(F.transpose(V), V) # (d,d)
-    return Q * triu_mask(input_size, F)
 
-class QuadraticLayer(gluon.nn.HybridBlock):
+    V: (k, d)
+    Returns Q: (d, d) with upper-triangular (i<j) entries kept, others zeroed.
+    """
+    # Q = V^T V
+    Q = V.transpose(0, 1) @ V  # (d, d)
+    mask = triu_mask(Q.shape[0], device=Q.device, dtype=Q.dtype)
+    return Q * mask
+
+
+class QuadraticLayer(nn.Module):
     """A neural network layer which applies quadratic function on the input.
 
-    This class defines train() method for easy use.
+    This class defines train_model() method for easy use.
     """
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self):
+        super().__init__()
+        self._optimizer = None
 
-    def init_params(self, initializer=mx.init.Normal()):
-        """Initialize all parameters
+    def init_params(self):
+        """Initialize parameters similar to mx.init.Normal()."""
+        # PyTorch標準の初期化（正規分布）に寄せる
+        for m in self.modules():
+            if isinstance(m, nn.Parameter):
+                continue
+        for p in self.parameters():
+            if p.dim() >= 1:
+                nn.init.normal_(p, mean=0.0, std=1.0)
 
-        Args:
-            initializer(mx.init.Initializer):
-                MXNet initializer object. [Default=mxnet.init.Normal()]
-        """
-        self.initialize(initializer, force_reinit=True)
+    def train_model(self, x, y, num_epoch=100, learning_rate=1.0e-2, device=None):
+        """Training of the regression model using Adam optimizer."""
+        self.train()
 
-    def train(self, x, y, num_epoch=100, learning_rate=1.0e-2):
-        """Training of the regression model using Adam optimizer.
-        """
-        x, y = nd.array(x), nd.array(y)
-        batchsize = x.shape[0]
-        if None == self.trainer:
-            self.trainer = gluon.Trainer(self.collect_params(), "adam", {"learning_rate": learning_rate})
+        x = torch.as_tensor(x, dtype=torch.float32, device=device)
+        y = torch.as_tensor(y, dtype=torch.float32, device=device)
+
+        if y.ndim == 1:
+            y = y.view(-1)
+
+        if self._optimizer is None:
+            self._optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
         else:
-            self.trainer.set_learning_rate(learning_rate)
-        for epoch in range(num_epoch):
-            with mx.autograd.record():
-                output = self(x)
-                loss = nd.mean((y - output)**2)
+            for g in self._optimizer.param_groups:
+                g["lr"] = learning_rate
+
+        for _ in range(num_epoch):
+            self._optimizer.zero_grad(set_to_none=True)
+            output = self(x).view(-1)
+            loss = torch.mean((y - output) ** 2)
             loss.backward()
-            self.trainer.step(batchsize, ignore_stale_grad=True)
+            self._optimizer.step()
 
     def get_bhQ(self):
         raise NotImplementedError()
+
 
 class FactorizationMachine(QuadraticLayer):
     """Factorization Machine as a neural network layer.
@@ -70,42 +87,62 @@ class FactorizationMachine(QuadraticLayer):
         factorization_size (int (<=input_size)):
             The rank of decomposition of interaction terms.
         act (string, optional):
-            Name of activation function applied on FM output: "identity", "sigmoid", or "tanh". (default="identity")
-        **kwargs:
+            "identity", "sigmoid", or "tanh". (default="identity")
     """
 
-    def __init__(self, input_size, factorization_size=8, act="identity", **kwargs):
-        super().__init__(**kwargs)
-        self.factorization_size = factorization_size
-        self.input_size = input_size
-        self.trainer = None
-        with self.name_scope():
-            self.h = self.params.get("h", shape=(input_size,), dtype=np.float32)
-            if factorization_size > 0:
-                self.V = self.params.get("V", shape=(factorization_size, input_size), dtype=np.float32)
-            else:
-                self.V = self.params.get("V", shape=(1, input_size), dtype=np.float32) # dummy V
-            self.bias = self.params.get("bias", shape=(1,), dtype=np.float32)
+    def __init__(self, input_size, factorization_size=8, act="identity"):
+        super().__init__()
+        self.factorization_size = int(factorization_size)
+        self.input_size = int(input_size)
+
+        # MXNet版: h shape=(d,), V shape=(k,d), bias shape=(1,)
+        self.h = nn.Parameter(torch.empty(self.input_size, dtype=torch.float32))
+        if self.factorization_size > 0:
+            self.V = nn.Parameter(torch.empty(self.factorization_size, self.input_size, dtype=torch.float32))
+        else:
+            # dummy V
+            self.V = nn.Parameter(torch.empty(1, self.input_size, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.empty(1, dtype=torch.float32))
+
         self.act = act
+        self.init_params()
 
-    def hybrid_forward(self, F, x, h, V, bias):
-        """Forward propagation of FM.
-
-        Args:
-          x: input vector of shape (N, d).
-          h: linear coefficient of lenth d.
-          V: matrix of shape (k, d).
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        x: (N, d)
+        Returns: (N,)
+        """
+        if x.ndim == 1:
+            x = x.view(1, -1)
+
         if self.factorization_size <= 0:
-            return bias + F.dot(x, h)
-        Q = VtoQ(V, F) # (d,d)
-        Qx = F.FullyConnected(x, weight=Q, bias=None, no_bias=True, num_hidden=self.input_size)
-        act = {"identity": F.identity, "sigmoid": F.sigmoid, "tanh": F.tanh}[self.act]
-        return act(bias + F.dot(x, h) +  F.sum(x*Qx, axis=1))
+            return (self.bias + x @ self.h).view(-1)
+
+        Q = VtoQ(self.V)  # (d, d)
+        # equivalent of MXNet FullyConnected with weight=Q, no bias: x @ Q.T
+        Qx = x @ Q.transpose(0, 1)  # (N, d)
+
+        if self.act == "identity":
+            act_fn = lambda t: t
+        elif self.act == "sigmoid":
+            act_fn = torch.sigmoid
+        elif self.act == "tanh":
+            act_fn = torch.tanh
+        else:
+            raise ValueError(f"Unknown activation: {self.act}")
+
+        out = self.bias + (x @ self.h) + torch.sum(x * Qx, dim=1)
+        return act_fn(out).view(-1)
 
     def get_bhQ(self):
-        """Returns linear and quadratic coefficients.
-        """
-        V = nd.zeros(self.V.shape) if self.factorization_size == 0 else self.V.data()
-        return self.bias.data().asscalar(), self.h.data().asnumpy(), VtoQ(V, nd).asnumpy()
-
+        """Returns (bias, h, Q) as (float, np.ndarray, np.ndarray)."""
+        with torch.no_grad():
+            if self.factorization_size == 0:
+                V = torch.zeros_like(self.V)
+            else:
+                V = self.V
+            Q = VtoQ(V)
+            b = float(self.bias.detach().cpu().view(-1)[0].item())
+            h = self.h.detach().cpu().numpy()
+            Qn = Q.detach().cpu().numpy()
+        return b, h, Qn
