@@ -1,7 +1,3 @@
-"""
-Trainable Binary Quadratic Model based on Factorization Machine (FMBQM)
-"""
-
 import numpy as np
 import torch
 from dimod.binary_quadratic_model import BinaryQuadraticModel
@@ -9,27 +5,14 @@ from dimod.vartypes import Vartype
 
 from .factorization_machine import FactorizationMachine
 
-__all__ = [
-    "FactorizationMachineBinaryQuadraticModel",
-    "FMBQM",
-]
-
 
 class FactorizationMachineBinaryQuadraticModel(BinaryQuadraticModel):
-    """FMBQM: Trainable BQM based on Factorization Machine"""
-
     def __init__(self, input_size, vartype, act="identity", **kwargs):
         init_linear = {i: 0.0 for i in range(input_size)}
         init_quadratic = {}
         init_offset = 0.0
         super().__init__(init_linear, init_quadratic, init_offset, vartype, **kwargs)
         self.fm = FactorizationMachine(input_size, act=act)
-
-    def to_qubo(self):
-        return self._fm_to_qubo()
-
-    def to_ising(self):
-        return self._fm_to_ising()
 
     @classmethod
     def from_data(cls, x, y, act="identity", num_epoch=1000, learning_rate=1.0e-2, device=None, **kwargs):
@@ -69,6 +52,11 @@ class FactorizationMachineBinaryQuadraticModel(BinaryQuadraticModel):
 
     def predict(self, x, device=None):
         self._check_vartype(x)
+
+        # deviceが未指定なら、モデルのdeviceに合わせる（混在エラー回避）
+        if device is None:
+            device = next(self.fm.parameters()).device
+
         x_t = torch.as_tensor(x, dtype=torch.float32, device=device)
         with torch.no_grad():
             pred = self.fm(x_t).detach().cpu().numpy()
@@ -88,9 +76,10 @@ class FactorizationMachineBinaryQuadraticModel(BinaryQuadraticModel):
             J = J / 4.0
         if scaling:
             scaling_factor = max(np.max(np.abs(h)), np.max(np.abs(J)))
-            b /= scaling_factor
-            h /= scaling_factor
-            J /= scaling_factor
+            if scaling_factor != 0:
+                b /= scaling_factor
+                h /= scaling_factor
+                J /= scaling_factor
         return {key: h[key] for key in range(len(h))}, {key: J[key] for key in zip(*J.nonzero())}, b
 
     def _fm_to_qubo(self, scaling=True):
@@ -102,13 +91,11 @@ class FactorizationMachineBinaryQuadraticModel(BinaryQuadraticModel):
         Q[np.diag_indices(len(Q))] = h
         if scaling:
             scaling_factor = np.max(np.abs(Q))
-            b /= scaling_factor
-            Q /= scaling_factor
+            if scaling_factor != 0:
+                b /= scaling_factor
+                Q /= scaling_factor
 
         Q_dict = {key: Q[key] for key in zip(*Q.nonzero())}
         for i in range(len(Q)):
             Q_dict[(i, i)] = Q[i, i]
         return Q_dict, b
-
-
-FMBQM = FactorizationMachineBinaryQuadraticModel
